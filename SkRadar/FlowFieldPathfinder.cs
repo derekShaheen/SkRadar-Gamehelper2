@@ -67,9 +67,6 @@ namespace Radar
         public bool TryGetDirectionField((int x, int y) target, out byte[,] field)
             => dirFieldByTarget.TryGetValue(target, out field);
 
-        public bool IsDirectionFieldReady((int x, int y) target)
-            => dirFieldByTarget.TryGetValue(target, out var field) && field is not null;
-
         /// <summary>
         /// Queue a build for a target if not already present.
         /// Returns false if already cached or build already started.
