@@ -17,6 +17,9 @@
     using SixLabors.ImageSharp.PixelFormats;
     using SixLabors.ImageSharp.Processing.Processors.Transforms;
     using SixLabors.ImageSharp.Processing;
+    using GameHelper.RemoteEnums;
+    using GameHelper.RemoteObjects.Components;
+    using GameHelper.RemoteEnums.Entity;
 
     /// <summary>
     /// <see cref="Radar"/> plugin.
