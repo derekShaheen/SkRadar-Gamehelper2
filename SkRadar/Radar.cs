@@ -60,8 +60,17 @@
         private FlowFieldPathfinder pathfinder;                 // Provided in a separate file (not included here)
         private readonly List<Vector2> _pathBuffer = new(1024); // reused per path to reduce allocs
 
-        // UI: path labels for currently drawn paths
-        private readonly List<(string Label, uint Color)> _currentPathLabels = new();
+        // UI list entries (for the side window)
+        private struct PathEntry
+        {
+            public string Label; // unique key now
+            public uint Color;
+            public float Length; // for sorting only (not shown)
+        }
+
+        private readonly List<PathEntry> _currentPaths = new();
+        private readonly HashSet<string> _selectedPathLabels = new(); // if non-empty, only draw these labels
+        private bool _isGeneratingPaths = false;
 
         /// <inheritdoc/>
         public override void DrawSettings()
@@ -110,8 +119,6 @@
             ImGui.Checkbox("Only Nearest POI", ref this.Settings.DrawOnlyNearestPOIPath);
             ImGui.Checkbox("Distinct Path Colors", ref this.Settings.UseDistinctPathColors);
             ImGui.SliderFloat("Path Thickness", ref this.Settings.PathThickness, 1f, 6f);
-
-            // Smoothing UI was previously removed per your request
 
             ImGui.Separator();
             ImGui.NewLine();
@@ -169,8 +176,8 @@
             if (Core.States.InGameStateObject.GameUi.SkillTreeNodesUiElements.Count > 0)
                 return;
 
-            // Clear labels each frame; will be repopulated when paths are drawn
-            _currentPathLabels.Clear();
+            // Clear UI entries each frame; will be repopulated when paths are processed
+            _currentPaths.Clear();
 
             if (largeMap.IsVisible)
             {
@@ -187,8 +194,11 @@
                 ImGui.Begin("###FullScreenCull", ImGuiHelper.TransparentWindowFlags);
                 ImGui.PopStyleVar();
 
+                _isGeneratingPaths = true;
                 this.DrawLargeMap(largeMapRealCenter);
-                this.DrawTgtFiles(largeMapRealCenter);      // includes path rendering + labels collection
+                this.DrawTgtFiles(largeMapRealCenter);      // includes path rendering + entries collection
+                _isGeneratingPaths = false;
+
                 this.DrawMapIcons(largeMapRealCenter, largeMapModifiedZoom * 5f);
 
                 ImGui.End();
@@ -216,30 +226,45 @@
                 ImGui.End();
             }
 
-            // ---- POI Paths Window (movable, persists position) ----
-            if (this.Settings.ShowPathsToPOI && _currentPathLabels.Count > 0)
+            // ---- POI Paths Window (movable, persists position; selectable & sorted) ----
+            if (this.Settings.ShowPathsToPOI && _currentPaths.Count > 0)
             {
-                // Only apply the saved position when the window appears (so user can still drag it).
                 ImGui.SetNextWindowPos(_poiWindowPos, ImGuiCond.Appearing);
                 ImGui.SetNextWindowSizeConstraints(new Vector2(200f, 100f), new Vector2(600f, 800f));
 
-                if (ImGui.Begin("POI Paths")) // default flags allow moving
+                if (ImGui.Begin("POI Paths"))
                 {
-                    // Remember current position every frame so we can restore it after area changes.
                     _poiWindowPos = ImGui.GetWindowPos();
                     _poiWindowPosSet = true;
 
-                    foreach (var (label, colorU32) in _currentPathLabels)
+                    // Generating indicator
+                    if (_isGeneratingPaths)
                     {
-                        var col = ImGui.ColorConvertU32ToFloat4(colorU32);
-                        ImGui.PushStyleColor(ImGuiCol.Text, col);
-                        ImGui.TextUnformatted(label);
+                        int dots = (int)(ImGui.GetTime() * 2.0 % 4.0);
+                        ImGui.TextDisabled($"Generating paths{new string('.', dots)}");
+                    }
+
+                    // Sort by length DESC for display
+                    var sorted = _currentPaths.OrderByDescending(e => e.Length).ToList();
+
+                    foreach (var entry in sorted)
+                    {
+                        bool isSelected = _selectedPathLabels.Contains(entry.Label);
+                        ImGui.PushStyleColor(ImGuiCol.Text, ImGui.ColorConvertU32ToFloat4(entry.Color));
+
+                        if (ImGui.Selectable($"{entry.Label}##{entry.Label}", isSelected))
+                        {
+                            if (isSelected)
+                                _selectedPathLabels.Remove(entry.Label);
+                            else
+                                _selectedPathLabels.Add(entry.Label);
+                        }
+
                         ImGui.PopStyleColor();
                     }
                 }
                 ImGui.End();
             }
-
         }
 
         /// <inheritdoc/>
@@ -256,7 +281,8 @@
             this.CleanUpRadarPluginCaches();
             this.pathfinder?.CancelAll();
             this.pathfinder = null;
-            _currentPathLabels.Clear();
+            _currentPaths.Clear();
+            _selectedPathLabels.Clear();
         }
 
         /// <inheritdoc/>
@@ -362,7 +388,29 @@
                 if (this.Settings.ImportantTgts.TryGetValue("common", out var commonTgts))
                     CollectLabeledPOIs(commonTgts, area, labeledPOIs);
 
-                // Optionally reduce to nearest single POI instance
+                // --- De-duplicate by LABEL (keep nearest instance to player) ---
+                if (labeledPOIs.Count > 1)
+                {
+                    var byLabel = new Dictionary<string, (Vector2 Pos, string Label, string Key)>(StringComparer.Ordinal);
+                    foreach (var poi in labeledPOIs)
+                    {
+                        if (!byLabel.TryGetValue(poi.Label, out var existing))
+                        {
+                            byLabel[poi.Label] = poi;
+                        }
+                        else
+                        {
+                            // keep the nearer of the two
+                            float dNew = Vector2.DistanceSquared(poi.Pos, anchor);
+                            float dOld = Vector2.DistanceSquared(existing.Pos, anchor);
+                            if (dNew < dOld)
+                                byLabel[poi.Label] = poi;
+                        }
+                    }
+                    labeledPOIs = byLabel.Values.ToList();
+                }
+
+                // Optionally reduce to nearest single POI (by label set)
                 if (this.Settings.DrawOnlyNearestPOIPath && labeledPOIs.Count > 1)
                 {
                     labeledPOIs.Sort((a, b) =>
@@ -370,17 +418,17 @@
                     labeledPOIs = new List<(Vector2, string, string)> { labeledPOIs[0] };
                 }
 
-                // Draw each path + register label/color for the side window
+                // Draw each path + register entry for the side window
                 foreach (var poi in labeledPOIs)
                 {
                     int tx = (int)MathF.Round(poi.Pos.X);
                     int ty = (int)MathF.Round(poi.Pos.Y);
 
                     // Snap target to nearest walkable if needed
-                    var snapped = FindClosestWalkable(area, tx, ty, 12) ?? (tx, ty);
+                    var snapped = FindClosestWalkable(area, tx, ty, 128) ?? (tx, ty);
                     var targetForField = (snapped.X, snapped.Y);
 
-                    // Ensure flow field exists
+                    // Build/ensure flow field
                     this.pathfinder.EnsureDirectionField(targetForField);
 
                     // Path from anchor to target
@@ -396,7 +444,6 @@
                         if (reachable is (int rx, int ry))
                         {
                             targetForField = (rx, ry);
-                            // Ensure field for the new goal, then try again
                             this.pathfinder.EnsureDirectionField(targetForField);
                             _pathBuffer.Clear();
                             havePath = this.pathfinder.TryGetPath((sx, sy), targetForField, _pathBuffer, 16384);
@@ -404,14 +451,32 @@
                     }
 
                     if (!havePath)
-                        continue; // still unreachable; skip drawing
+                        continue; // unreachable; skip
 
                     // Choose color
                     uint pathColorU32 = this.Settings.UseDistinctPathColors
                         ? DistinctColorForPointU32(targetForField.X, targetForField.Y, this.Settings.PathThickness)
                         : basePoiTextColor;
 
-                    // Draw the path
+                    // Compute length (in cells) for sorting (not shown in label)
+                    float length = ComputePathLength(_pathBuffer);
+
+                    // Record entry (by label; label is unique now)
+                    if (!_currentPaths.Any(e => string.Equals(e.Label, poi.Label, StringComparison.Ordinal)))
+                    {
+                        _currentPaths.Add(new PathEntry
+                        {
+                            Label = poi.Label,
+                            Color = pathColorU32,
+                            Length = length
+                        });
+                    }
+
+                    // If there is a selection, only draw selected labels
+                    if (_selectedPathLabels.Count > 0 && !_selectedPathLabels.Contains(poi.Label))
+                        continue;
+
+                    // Draw the path polyline (trim near anchor: 1.0f)
                     DrawPathPolylineOnMap(
                         fgDraw, mapCenter, area, playerRender, anchor,
                         _pathBuffer, pathColorU32, this.Settings.PathThickness, 1.0f);
@@ -422,20 +487,20 @@
                     var endDelta = Helper.DeltaInWorldToMapDelta(end - anchor, -playerRender.TerrainHeight + eh);
                     var endPt = mapCenter + endDelta;
                     fgDraw.AddCircleFilled(endPt, 3f, pathColorU32);
-
-                    // Register label for side window (dedupe identical label/color pairs for cleanliness)
-                    if (!_currentPathLabels.Any(x => x.Label == poi.Label && x.Color == pathColorU32))
-                        _currentPathLabels.Add((poi.Label, pathColorU32));
                 }
             }
 
             // ----- POI TEXTS ON MAP (unchanged) -----
-            uint col = basePoiTextColor;
+            uint col = ImGuiHelper.Color(
+                (uint)(this.Settings.POIColor.X * 255),
+                (uint)(this.Settings.POIColor.Y * 255),
+                (uint)(this.Settings.POIColor.Z * 255),
+                (uint)(this.Settings.POIColor.W * 255));
 
             void drawString(string text, Vector2 location, Vector2 stringImGuiSize, bool drawBackground)
             {
                 float height = HeightAt(area, (int)location.X, (int)location.Y);
-                var fpos = Helper.DeltaInWorldToMapDelta(location - anchor, -playerRender.TerrainHeight + height);
+                var fpos = Helper.DeltaInWorldToMapDelta(location - new Vector2(playerRender.GridPosition.X, playerRender.GridPosition.Y), -playerRender.TerrainHeight + height);
                 if (drawBackground)
                 {
                     fgDraw.AddRectFilled(
@@ -451,7 +516,7 @@
                     col,
                     text);
             }
-            
+
             if (this.Settings.ShowImportantPOI)
             {
                 if (this.Settings.ImportantTgts.TryGetValue(this.currentAreaName, out var importantTgtsOfCurrentArea))
@@ -731,6 +796,9 @@
                 this.pathfinder?.CancelAll();
                 this.pathfinder = new FlowFieldPathfinder(area);
 
+                // reset selection on area change (show all paths again)
+                _selectedPathLabels.Clear();
+
                 this.GenerateMapTexture();
             }
         }
@@ -925,8 +993,9 @@
         }
 
         // -----------------------
-        // Helpers (path colors, height/Walkable, drawing polyline)
+        // Helpers (path colors, length, height/Walkable, drawing polyline)
         // -----------------------
+
         // Try to find a walkable tile near (tx,ty) that is actually reachable from 'start'.
         // We keep attempts small to avoid perf spikes (you can tune MAX_RADIUS / SAMPLES_PER_RING).
         private (int X, int Y)? FindNearestReachableNearTarget(
@@ -951,7 +1020,6 @@
             // For each candidate: ensure walkable -> ensure field -> try path
             for (int r = 2; r <= MAX_RADIUS; r += 2)
             {
-                // number of angular samples per ring (cap so it doesn't explode)
                 int samples = Math.Clamp(SAMPLES_PER_RING + r / 8, SAMPLES_PER_RING, 32);
                 for (int i = 0; i < samples; i++)
                 {
@@ -1032,19 +1100,35 @@
             return 0f;
         }
 
+        private static float ComputePathLength(List<Vector2> path)
+        {
+            int n = path?.Count ?? 0;
+            if (n < 2) return 0f;
+            float sum = 0f;
+            var prev = path[0];
+            for (int i = 1; i < n; i++)
+            {
+                var cur = path[i];
+                sum += Vector2.Distance(prev, cur);
+                prev = cur;
+            }
+            return sum;
+        }
+
         private void DrawPathPolylineOnMap(ImDrawListPtr dl, Vector2 mapCenter,
             GameHelper.RemoteObjects.States.InGameStateObjects.AreaInstance area,
             Render playerRender, Vector2 anchor, List<Vector2> path,
             uint color, float thickness, float trimDist)
         {
-            if (path.Count == 0) return;
+            int n = path?.Count ?? 0;
+            if (n == 0) return;
 
-            if (path.Count == 1)
+            if (n == 1)
             {
                 // draw a minimal hint from anchor to the single node
                 var node = path[0];
                 float h0 = HeightAt(area, (int)node.X, (int)node.Y);
-                var p0 = mapCenter + Helper.DeltaInWorldToMapDelta(anchor - anchor, 0);         // anchor on mapCenter
+                var p0 = mapCenter; // anchor maps to mapCenter delta(0)
                 var p1 = mapCenter + Helper.DeltaInWorldToMapDelta(node - anchor, -playerRender.TerrainHeight + h0);
                 dl.AddLine(p0, p1, color, Math.Max(1f, thickness));
                 return;
@@ -1053,14 +1137,19 @@
             int startIdx = 0;
             if (trimDist > 0f)
             {
-                for (int i = 0; i < path.Count; i++)
+                for (int i = 0; i < n; i++)
                 {
-                    if (Vector2.Distance(anchor, path[i]) >= trimDist) { startIdx = Math.Max(0, i - 1); break; }
+                    if (Vector2.Distance(anchor, path[i]) >= trimDist)
+                    {
+                        startIdx = Math.Max(0, i - 1);
+                        break;
+                    }
                 }
             }
+            if (startIdx >= n) startIdx = n - 1;
 
             Vector2? last = null;
-            for (int i = startIdx; i < path.Count; i += 2)
+            for (int i = startIdx; i < n; i += 2)
             {
                 var node = path[i];
                 float h = HeightAt(area, (int)node.X, (int)node.Y);
@@ -1071,13 +1160,12 @@
 
             if (last is Vector2 lp2)
             {
-                var endNode = path[^1];
+                var endNode = path[n - 1];
                 float he = HeightAt(area, (int)endNode.X, (int)endNode.Y);
                 var ptEnd = mapCenter + Helper.DeltaInWorldToMapDelta(endNode - anchor, -playerRender.TerrainHeight + he);
                 dl.AddLine(lp2, ptEnd, color, thickness);
             }
         }
-
 
         private static uint DistinctColorForPointU32(int x, int y, float thickness)
         {
