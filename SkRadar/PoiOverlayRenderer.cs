@@ -66,6 +66,11 @@ namespace Radar
                     labeledPOIs.RemoveRange(1, labeledPOIs.Count - 1);
                 }
 
+                var computedPaths = new List<(List<Vector2> Path, (int X, int Y) Goal, string Label, uint Color)>(labeledPOIs.Count);
+                bool pendingPaths = false;
+                int sx = (int)MathF.Round(anchor.X);
+                int sy = (int)MathF.Round(anchor.Y);
+
                 foreach (var poi in labeledPOIs)
                 {
                     int tx = (int)MathF.Round(poi.Pos.X);
@@ -76,49 +81,58 @@ namespace Radar
 
                     this.pathfinder.EnsureDirectionField(targetForField);
 
-                    int sx = (int)MathF.Round(anchor.X);
-                    int sy = (int)MathF.Round(anchor.Y);
-                    this.pathBuffer.Clear();
-                    bool havePath = this.pathfinder.TryGetPath((sx, sy), targetForField, this.pathBuffer, 16384);
-
-                    if (!havePath)
+                    if (!this.pathfinder.IsDirectionFieldReady(targetForField))
                     {
-                        var reachable = this.FindNearestReachableNearTarget(area, anchor, tx, ty);
-                        if (reachable is (int rx, int ry))
-                        {
-                            targetForField = (rx, ry);
-                            this.pathfinder.EnsureDirectionField(targetForField);
-                            this.pathBuffer.Clear();
-                            havePath = this.pathfinder.TryGetPath((sx, sy), targetForField, this.pathBuffer, 16384);
-                        }
+                        pendingPaths = true;
+                        continue;
                     }
 
-                    if (!havePath)
+                    if (pendingPaths)
                         continue;
 
+                    this.pathBuffer.Clear();
+                    if (!this.TryBuildPathForTarget(area, sx, sy, targetForField, this.pathBuffer, out var finalGoal, out var pendingForPoi))
+                    {
+                        if (pendingForPoi)
+                            pendingPaths = true;
+
+                        continue;
+                    }
+
                     uint pathColor = this.owner.Settings.UseDistinctPathColors
-                        ? DistinctColorForPointU32(targetForField.X, targetForField.Y, this.owner.Settings.PathThickness)
+                        ? DistinctColorForPointU32(finalGoal.X, finalGoal.Y, this.owner.Settings.PathThickness)
                         : basePoiTextColor;
 
+                    computedPaths.Add((new List<Vector2>(this.pathBuffer), finalGoal, poi.Label, pathColor));
+                }
+
+                if (pendingPaths)
+                    return;
+
+                foreach (var pathInfo in computedPaths)
+                {
                     DrawPathPolylineOnMap(
                         fgDraw,
                         mapCenter,
                         area,
                         playerRender,
                         anchor,
-                        this.pathBuffer,
-                        pathColor,
+                        pathInfo.Path,
+                        pathInfo.Color,
                         this.owner.Settings.PathThickness,
                         1.0f);
 
-                    var end = this.pathBuffer.Count > 0 ? this.pathBuffer[^1] : new Vector2(targetForField.X, targetForField.Y);
+                    var end = pathInfo.Path.Count > 0
+                        ? pathInfo.Path[^1]
+                        : new Vector2(pathInfo.Goal.X, pathInfo.Goal.Y);
+
                     float endHeight = HeightAt(area, (int)end.X, (int)end.Y);
                     var endDelta = Helper.DeltaInWorldToMapDelta(end - anchor, -playerRender.TerrainHeight + endHeight);
                     var endPoint = mapCenter + endDelta;
-                    fgDraw.AddCircleFilled(endPoint, 3f, pathColor);
+                    fgDraw.AddCircleFilled(endPoint, 3f, pathInfo.Color);
 
-                    if (!this.currentPathLabels.Any(x => x.Label == poi.Label && x.Color == pathColor))
-                        this.currentPathLabels.Add((poi.Label, pathColor));
+                    if (!this.currentPathLabels.Any(x => x.Label == pathInfo.Label && x.Color == pathInfo.Color))
+                        this.currentPathLabels.Add((pathInfo.Label, pathInfo.Color));
                 }
             }
 
@@ -191,23 +205,63 @@ namespace Radar
                 this.pathfinder = new FlowFieldPathfinder(area);
         }
 
-        private (int X, int Y)? FindNearestReachableNearTarget(
+        private bool TryBuildPathForTarget(
             AreaInstance area,
-            Vector2 start,
+            int sx,
+            int sy,
+            (int X, int Y) initialTarget,
+            List<Vector2> path,
+            out (int X, int Y) goal,
+            out bool pending)
+        {
+            goal = initialTarget;
+            pending = false;
+
+            if (this.pathfinder.TryGetPath((sx, sy), initialTarget, path, 16384))
+                return true;
+
+            return this.TryFindPathToNearestReachable(
+                area,
+                sx,
+                sy,
+                initialTarget.X,
+                initialTarget.Y,
+                path,
+                out goal,
+                out pending);
+        }
+
+        private bool TryFindPathToNearestReachable(
+            AreaInstance area,
+            int sx,
+            int sy,
             int tx,
             int ty,
+            List<Vector2> path,
+            out (int X, int Y) goal,
+            out bool pending,
             int maxRadius = 48,
             int samplesPerRing = 12)
         {
+            goal = default;
+            pending = false;
+
             var first = FindClosestWalkable(area, tx, ty, 48);
             if (first is (int fx, int fy))
             {
                 this.pathfinder.EnsureDirectionField(first.Value);
-                int sx = (int)MathF.Round(start.X);
-                int sy = (int)MathF.Round(start.Y);
-                this.pathBuffer.Clear();
-                if (this.pathfinder.TryGetPath((sx, sy), first.Value, this.pathBuffer, 16384))
-                    return first;
+                if (!this.pathfinder.IsDirectionFieldReady(first.Value))
+                {
+                    pending = true;
+                    return false;
+                }
+
+                path.Clear();
+                if (this.pathfinder.TryGetPath((sx, sy), first.Value, path, 16384))
+                {
+                    goal = first.Value;
+                    return true;
+                }
             }
 
             for (int r = 2; r <= maxRadius; r += 2)
@@ -222,18 +276,26 @@ namespace Radar
                     if (candidate is not (int gx, int gy))
                         continue;
 
-                    var goal = (gx, gy);
-                    this.pathfinder.EnsureDirectionField(goal);
+                    var goalCandidate = (gx, gy);
+                    this.pathfinder.EnsureDirectionField(goalCandidate);
 
-                    int sx = (int)MathF.Round(start.X);
-                    int sy = (int)MathF.Round(start.Y);
-                    this.pathBuffer.Clear();
-                    if (this.pathfinder.TryGetPath((sx, sy), goal, this.pathBuffer, 16384))
-                        return goal;
+                    if (!this.pathfinder.IsDirectionFieldReady(goalCandidate))
+                    {
+                        pending = true;
+                        return false;
+                    }
+
+                    path.Clear();
+                    if (this.pathfinder.TryGetPath((sx, sy), goalCandidate, path, 16384))
+                    {
+                        goal = goalCandidate;
+                        return true;
+                    }
                 }
             }
 
-            return null;
+            path.Clear();
+            return false;
         }
 
         private static void CollectLabeledPOIs(Dictionary<string, string> dict, AreaInstance area, List<(Vector2 Pos, string Label, string Key)> output)
