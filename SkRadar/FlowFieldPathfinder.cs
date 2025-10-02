@@ -28,10 +28,14 @@ namespace Radar
         private readonly int height;
         private readonly bool[,] walkable; // [y,x]
         private readonly ConcurrentDictionary<(int x, int y), byte[,]> dirFieldByTarget = new(); // 0=blocked, 1..8 = index into Neigh (direction to step)
+        private readonly SemaphoreSlim buildSemaphore;
         private CancellationTokenSource cts = new();
 
         public FlowFieldPathfinder(AreaInstance area)
         {
+            int maxParallelBuilds = Math.Clamp(Environment.ProcessorCount / 2, 1, 4);
+            this.buildSemaphore = new SemaphoreSlim(maxParallelBuilds, maxParallelBuilds);
+
             // Build walkable grid from nibbles (>0 = passable)
             var bytesPerRow = Math.Max(1, area.TerrainMetadata.BytesPerRow);
             width = bytesPerRow * 2;
@@ -75,13 +79,25 @@ namespace Radar
             // Reserve a placeholder so other callers don't spin up duplicate builds.
             dirFieldByTarget.TryAdd(target, null);
 
-            Task.Run(() =>
+            Task.Run(async () =>
             {
                 try
                 {
-                    var df = BuildDirectionField(target, token);
-                    if (df is null) { dirFieldByTarget.TryRemove(target, out _); return; }
-                    dirFieldByTarget[target] = df;
+                    bool acquired = false;
+                    try
+                    {
+                        await buildSemaphore.WaitAsync(token).ConfigureAwait(false);
+                        acquired = true;
+                        token.ThrowIfCancellationRequested();
+                        var df = BuildDirectionField(target, token);
+                        if (df is null) { dirFieldByTarget.TryRemove(target, out _); return; }
+                        dirFieldByTarget[target] = df;
+                    }
+                    finally
+                    {
+                        if (acquired)
+                            buildSemaphore.Release();
+                    }
                 }
                 catch (OperationCanceledException)
                 {
